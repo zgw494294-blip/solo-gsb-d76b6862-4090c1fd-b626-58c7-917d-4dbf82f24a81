@@ -86,6 +86,17 @@ POST /v1/first-failure-time
   （顶事件尚未发生）状态做概率动态规划；steps/transitions 非法、
   转移项缺失、多余或 fail/recover 非法概率时返回 422。
 
+POST /v1/observation-conflicts
+  另收 observations：1~16 个已声明事件或门 id 到严格布尔值的映射，
+  表示同一时刻的一组读数。返回全部最小零概率观测组：组内读数同时
+  成立的先验概率为 0，且删去组内任一项后概率大于 0；全部读数可同时
+  成立时返回空组列。门读数按共享事件状态求值，NOT 照常生效；p 为
+  0/1 或 1/1 造成的零概率同样识别。响应 conflicts 每组只列观测 id，
+  组内按 id 排序，组间按长度及字典序排序。把 p∈{0,1} 事件的强制文字
+  折叠进各观测约束后，在共享 ROBDD 上按观测子集枚举合取作精确判定，
+  不枚举事件赋值；结果超过 5000 组或累计非终端节点超过 50000 时
+  返回 422。
+
 所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
 
@@ -101,6 +112,7 @@ from pydantic import BaseModel, Field, StrictBool, StrictInt
 from pydantic.config import ConfigDict
 
 from .bdd import MAX_NONTERMINAL_NODES, NodeLimitExceeded, ROBDD
+from .conflicts import minimal_zero_prob_groups
 from .cutsets import compute_cut_set_families
 from .first_hit import first_failure_distribution, top_hit_masks
 from .likely import most_likely_assignment
@@ -331,6 +343,30 @@ class FirstFailureTimeResponse(BaseModel):
     )
     no_hit_probability: str = Field(
         ..., description="直到第 steps 步顶事件始终未发生的概率，约分 n/d"
+    )
+
+
+class ObservationConflictsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=32)
+    gates: List[GateIn] = Field(default_factory=list, max_length=64)
+    top: str = Field(..., min_length=1, description="顶层节点 id（事件或门）")
+    observations: Dict[str, StrictBool] = Field(
+        ...,
+        min_length=1,
+        max_length=16,
+        description=(
+            "同一时刻的读数：1~16 个已声明事件或门 id 到严格布尔值的映射"
+        ),
+    )
+
+
+class ObservationConflictsResponse(BaseModel):
+    conflicts: List[List[str]] = Field(
+        ...,
+        description="全部最小零概率观测组：每组只列观测 id，组内按 id 排序，"
+        "组间按长度及字典序排序；全部读数可同时成立时为空",
     )
 
 
@@ -1104,6 +1140,50 @@ def first_failure_time_logic(
     )
 
 
+def observation_conflicts_logic(
+    payload: ObservationConflictsRequest,
+) -> ObservationConflictsResponse:
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+    sorted_events = sorted(probs)
+
+    # 观测键必须指向已声明的事件或门（同 /v1/diagnose）
+    known_ids = set(probs) | set(gate_ops)
+    unknown = [k for k in payload.observations if k not in known_ids]
+    if unknown:
+        raise ValueError(
+            "observations 引用了未声明的事件或门 id："
+            + ", ".join(repr(k) for k in unknown)
+        )
+
+    # 被观测的门（即便 top 不可达）也要构建到同一 ROBDD 中
+    observed_gates = tuple(
+        k for k in payload.observations if k in gate_ops
+    )
+    _, bdd, _, node_map = build_tree_robdd(
+        probs, gate_ops, gate_inputs, payload.top, also=observed_gates
+    )
+
+    # 观测按 id 字典序排列；读 1 取节点本身，读 0 取其 BDD 取反，
+    # 同一事件/门的多处引用共享同一 BDD 节点，天然共享状态
+    obs_ids = sorted(payload.observations)
+    constraints = [
+        node_map[oid] if payload.observations[oid] else bdd.negate(node_map[oid])
+        for oid in obs_ids
+    ]
+
+    prob_list = [probs[eid] for eid in sorted_events]
+    groups = minimal_zero_prob_groups(bdd, constraints, prob_list)
+
+    # 位掩码展开为观测 id 列表（下标序即 id 字典序，组内天然有序）；
+    # 组间先按组长度、再按 id 序列字典序排序
+    conflicts = [
+        [obs_ids[i] for i in range(len(obs_ids)) if mask >> i & 1]
+        for mask in groups
+    ]
+    conflicts.sort(key=lambda ids: (len(ids), ids))
+    return ObservationConflictsResponse(conflicts=conflicts)
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
@@ -1234,4 +1314,20 @@ async def first_failure_time(
     except ValueError as exc:
         # 事件超限、steps 越界、transitions 缺项/多余、fail/recover
         # 非法概率、未知引用、环等全部语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post(
+    "/v1/observation-conflicts", response_model=ObservationConflictsResponse
+)
+async def observation_conflicts(
+    payload: ObservationConflictsRequest,
+) -> ObservationConflictsResponse:
+    try:
+        return observation_conflicts_logic(payload)
+    except NodeLimitExceeded as exc:
+        # 树构建、强制文字折叠或子集合取枚举时累计非终端节点超过限制
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ValueError as exc:
+        # 未知引用、环、非法观测键/值、组数超限等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]

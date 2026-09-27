@@ -28,6 +28,9 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 `t=0` 各事件按自身 `p` 独立生成状态，此后每步正常事件按 `fail` 故障、故障事件按 `recover` 恢复，
 给定上一步状态后各事件独立转移；返回顶事件**首次**在第 `t` 步（`t=0`～`steps`）发生的概率
 `first_hit_distribution` 与全程未发生的 `no_hit_probability`。
+还提供观测冲突定位接口 `POST /v1/observation-conflicts`：给定 1～16 个对事件或门的布尔读数，
+返回全部**最小零概率观测组**——组内读数同时成立的先验概率为 0、但删去组内任一项后概率大于 0；
+全部读数可同时成立时返回空组列。
 
 ## 快速启动（Docker Compose）
 
@@ -47,6 +50,7 @@ docker compose up --build
 - 改版对比接口：`http://localhost:8000/v1/compare-trees`
 - 失效数分布接口：`http://localhost:8000/v1/failure-count`
 - 首次故障时间接口：`http://localhost:8000/v1/first-failure-time`
+- 观测冲突定位接口：`http://localhost:8000/v1/observation-conflicts`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -653,6 +657,72 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
 { "detail": "transitions 缺少事件的对应项：'pump_fail'" }
 ```
 
+## 观测冲突定位示例（POST /v1/observation-conflicts）
+
+在 `events` / `gates` / `top` 之外，另收 `observations`：**1～16 个**已声明**事件或门 id**
+到**严格布尔值**的映射（格式与校验同 `/v1/diagnose`），表示同一时刻读到的一组读数。
+本接口找出读数之间全部**最小零概率观测组**：
+
+- 组内读数**同时成立的先验概率为 0**——要么结构上不可能同时成立（如 `a=true` 与
+  `NOT a=true`），要么结构可满足但每个满足赋值都把某个 `p=0/1` / `p=1/1` 的事件取在
+  零概率一侧（如把 `p=0/1` 的事件读成 `true`）；
+- **最小**：删去组内任一项后，剩余读数同时成立的概率大于 0。
+
+全部读数可同时成立（联合概率大于 0）时返回空组列。门读数按共享事件状态求值，`NOT`
+照常生效；同一事件的多处引用共享同一状态。响应的 `conflicts` 每组只列观测 id：
+组内按 id 字典序排序，组间先按组长度、再按 id 序列字典序排序。
+
+仍以电机冷却系统为例，增设冷却状态指示灯 `cooling_ok = NOT cooling_fail`：指示灯显示
+冷却正常、电机也未过热，但泵实际已失效——指示灯读数与泵读数矛盾：
+
+```bash
+curl -X POST http://localhost:8000/v1/observation-conflicts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "motor_overheat", "p": "1/100"},
+      {"id": "coolant_loss",  "p": "2/100"},
+      {"id": "pump_fail",     "p": "1/200"}
+    ],
+    "gates": [
+      {"id": "cooling_fail", "op": "OR",
+       "inputs": ["coolant_loss", "pump_fail"]},
+      {"id": "cooling_ok", "op": "NOT", "inputs": ["cooling_fail"]},
+      {"id": "top", "op": "OR",
+       "inputs": ["motor_overheat", "cooling_fail"]}
+    ],
+    "top": "top",
+    "observations": {
+      "cooling_ok": true,
+      "motor_overheat": false,
+      "pump_fail": true
+    }
+  }'
+```
+
+响应：
+
+```json
+{
+  "conflicts": [
+    ["cooling_ok", "pump_fail"]
+  ]
+}
+```
+
+- `cooling_ok=true` 等价于 `cooling_fail=false`，即 `coolant_loss=false` 且
+  `pump_fail=false`，与 `pump_fail=true` 的读数矛盾；删去任一项后剩余读数都可成立，
+  故 `["cooling_ok", "pump_fail"]` 是最小零概率组。`motor_overheat=false` 与其余读数
+  都不冲突，不出现在任何组中。
+- 全部读数可同时成立时返回空组列：`{"conflicts": []}`。
+- `p=0/1` 的事件被读成 `true`（或 `p=1/1` 被读成 `false`）时，该读数单独成组，
+  例如 `{"conflicts": [["a"]]}`。
+- 计算复用决策图作精确判定，**不枚举事件赋值**：把 `p∈{0,1}` 事件的强制文字
+  （`p=1/1` 取 `x`、`p=0/1` 取 `¬x`）折叠进各观测约束后，零概率等价于约束合取在
+  ROBDD 上恒为假；再按观测子集枚举合取（子集合取复用同一唯一表），利用"零概率
+  关于组的包含关系单调"跳过已知含冲突的超集。
+- 结果超过 **5000** 组、或累计非终端节点超过 **50000** 时返回 422 并说明原因。
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -674,6 +744,7 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
 | `events`（仅 `/v1/first-failure-time`） | **1～8** 个，`p` 规则同上；`gates`（0～64）与 `top` 沿用 `/v1/analyze` 全部校验 |
 | `steps`（仅 `/v1/first-failure-time`） | 必填，**1～10** 的整数转移步数 |
 | `transitions`（仅 `/v1/first-failure-time`） | 必填，键必须**恰好覆盖全部事件 id**；每项含 `fail`、`recover` 两个 `n/d` 概率（`0≤n≤d≤10^6`），分别为每步的故障概率与恢复概率 |
+| `observations`（仅 `/v1/observation-conflicts`） | 必填，**1～16** 个键值对；键必须是已声明的事件或门 id，值为严格布尔值；返回这组读数之间的全部最小零概率观测组 |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -700,6 +771,13 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
 的状态质量当场吸收进当步 `first_hit` 并移出活跃分布——动态规划始终只在未触发状态上进行。
 全部质量以公分母下的整数传播（转移分母逐事件以最小公倍数并入，仅整数乘加），最终统一约分
 为 `n/d`，无浮点误差。
+`/v1/observation-conflicts` 把各观测读数化为同一 ROBDD 上的约束节点（读 `false` 取反），
+再把 `p∈{0,1}` 事件的强制文字（`p=1/1` 取 `x`、`p=0/1` 取 `¬x`）折叠进每个约束：完整赋值
+概率大于 0 当且仅当满足全部强制文字，故"组内读数同时成立的先验概率为 0"等价于折叠后约束
+的合取恒为假（终端 0），结构矛盾与 `p=0/1`、`1/1` 造成的零概率被统一识别。随后按观测子集
+（至多 16 个观测）自底向上枚举合取：完全合取非零时直接返回空组列；否则利用零概率关于组的
+包含关系单调，跳过删单元素后已知零概率的超集，其余子集各经一次 `and_` 在共享唯一表上求值，
+为终端 0 即一个最小组，全程不枚举事件赋值。
 
 ## 错误处理（HTTP 422）
 
@@ -732,12 +810,17 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
 - `/v1/first-failure-time` 的 `steps` 不是 **1～10** 的整数（类型错误如字符串、布尔、
   浮点同样拒绝）、`transitions` 缺少事件对应项或出现未知事件键（多项一并说明）、
   某项的 `fail` / `recover` 不是合法 `n/d` 概率（规则同事件 `p`），或事件数超出 **8** 个；
+- `/v1/observation-conflicts` 的 `observations` 为空或超过 **16** 个、键不是已声明的
+  事件或门 id、值不是严格布尔值（`1`、`0`、字符串等同样拒绝）；
+- `/v1/observation-conflicts` 的最小零概率观测组超过 **5000** 组；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
-  `/v1/likely-cause`、`/v1/failure-count` 与 `/v1/first-failure-time`；其中
+  `/v1/likely-cause`、`/v1/failure-count`、`/v1/first-failure-time` 与
+  `/v1/observation-conflicts`；其中
   `/v1/diagnose`、`/v1/inspect-next`、`/v1/likely-cause` 还含合取观测约束与候选分支
   新增的节点，`/v1/failure-count` 的计数动态规划与 `/v1/first-failure-time` 的状态空间
   动态规划均不新增 BDD 节点，限额仅针对故障树建图；
+  `/v1/observation-conflicts` 还含强制文字折叠与观测子集合取枚举新增的节点；
   `/v1/compare-trees` 为两版建图及差异运算的累计）。
 
 环示例响应：
@@ -766,6 +849,7 @@ python -m pytest -q
 app/
   __init__.py
   bdd.py       # ROBDD：唯一表、ITE 算子、精确概率/重要度、联合证据加权与失效数计数分布
+  conflicts.py # 最小零概率观测组：强制文字折叠 + 观测子集合取枚举（5000 组上限）
   cutsets.py   # 最小割集：位掩码割集族、去重吸收、5000 组上限
   repair.py    # 修复方案：ROBDD 上的受限赋值动态规划（成本/修复数/字典序）
   likely.py    # 最可能成因：ROBDD 上的最大先验乘积赋值动态规划（false 优先）
@@ -783,4 +867,5 @@ tests/test_likely_cause.py
 tests/test_compare_trees.py
 tests/test_failure_count.py
 tests/test_first_failure_time.py
+tests/test_observation_conflicts.py
 ```
