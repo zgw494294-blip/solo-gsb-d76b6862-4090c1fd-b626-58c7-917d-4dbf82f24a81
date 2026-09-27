@@ -109,6 +109,27 @@ class ROBDD:
         return self.ite(f, 1, g)
 
     # ---- 精确概率与重要度 ----
+    def extend_probabilities(
+        self,
+        probs: List[Fraction],
+        table: List[Fraction],
+    ) -> List[Fraction]:
+        """增量补齐节点概率表到当前唯一表大小，返回同一 table。
+
+        BDD 节点只增不删、子节点 id 恒小于父节点，故新建节点的概率只依赖
+        已有节点与事件先验：从 table 当前长度继续向后传播即可，不必重算
+        旧节点。终端 0/1 恒为 0/1，table 至少含两项占位。
+        """
+        if len(table) < 2:
+            table[:] = [Fraction(0), Fraction(1)]
+        for nid in range(len(table), len(self.nodes)):
+            node = self.nodes[nid]
+            assert node is not None
+            var, low, high = node
+            p = table[high] - table[low]
+            table.append(table[low] + probs[var] * p)
+        return table
+
     def node_probabilities(self, probs: List[Fraction]) -> List[Fraction]:
         """自底向上求唯一表中每个节点的发生概率，按节点 id 索引返回。
 

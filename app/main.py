@@ -30,6 +30,15 @@ POST /v1/diagnose
   同一 ROBDD 合取观测约束后精确加权，不枚举事件状态；累计非终端
   节点超过 50000 或观测键/值非法时返回 422。
 
+POST /v1/observation-conflicts
+  另收 observations：1~16 个已声明事件或门 id 到严格布尔值的映射，
+  格式与校验同 /v1/diagnose。返回 conflicts：全部最小零概率观测组——
+  组内读数同时成立的先验概率为 0，且删去组内任一项后概率严格大于 0；
+  全部读数可同时成立时返回空组列。门读数按共享事件状态求值（NOT 照常
+  生效），结构矛盾与 p 为 0/1、1/1 先验造成的零概率都须识别。每组只列
+  观测 id（组内按 id 排序，组间按长度及字典序排序）；结果超过 5000 组
+  或累计 ROBDD 非终端节点超过 50000 时返回 422。
+
 POST /v1/inspect-next
   另收 observations（0~16 个，可为空，格式同 /v1/diagnose）与
   candidates（1~16 个互异、已声明且未被观测的事件或门 id）。
@@ -101,6 +110,10 @@ from pydantic import BaseModel, Field, StrictBool, StrictInt
 from pydantic.config import ConfigDict
 
 from .bdd import MAX_NONTERMINAL_NODES, NodeLimitExceeded, ROBDD
+from .conflicts import (
+    ConflictLimitExceeded,
+    minimal_zero_probability_groups,
+)
 from .cutsets import compute_cut_set_families
 from .first_hit import first_failure_distribution, top_hit_masks
 from .likely import most_likely_assignment
@@ -186,6 +199,17 @@ class DiagnoseRequest(BaseModel):
 class DiagnoseResponse(BaseModel):
     evidence_probability: str
     posteriors: Dict[str, str]
+
+
+class ObservationConflictsResponse(BaseModel):
+    conflicts: List[List[str]] = Field(
+        ...,
+        description=(
+            "全部最小零概率观测组：组内读数同时成立的先验概率为 0，删去"
+            "组内任一项后概率严格大于 0；每组只列观测 id，组内按 id 排序，"
+            "组间按长度及字典序排序；全部读数可同时成立时为空列表"
+        ),
+    )
 
 
 class InspectNextRequest(BaseModel):
@@ -701,6 +725,44 @@ def diagnose_logic(payload: DiagnoseRequest) -> DiagnoseResponse:
     )
 
 
+def observation_conflicts_logic(
+    payload: DiagnoseRequest,
+) -> ObservationConflictsResponse:
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+    sorted_events = sorted(probs)
+
+    # 观测键必须指向已声明的事件或门（同 /v1/diagnose）
+    known_ids = set(probs) | set(gate_ops)
+    unknown = [k for k in payload.observations if k not in known_ids]
+    if unknown:
+        raise ValueError(
+            "observations 引用了未声明的事件或门 id："
+            + ", ".join(repr(k) for k in unknown)
+        )
+
+    # 观测 id 按字典序固定为读数下标顺序（响应组内/组间排序的基准）
+    obs_ids = sorted(payload.observations)
+
+    # 被观测的门（即便 top 不可达）也要构建到同一 ROBDD 中
+    observed_gates = tuple(k for k in obs_ids if k in gate_ops)
+    _, bdd, _, node_map = build_tree_robdd(
+        probs, gate_ops, gate_inputs, payload.top, also=observed_gates
+    )
+
+    # 每个读数字面量：读 1 即门/事件本身，读 0 即其 BDD 取反
+    literals = [
+        node_map[obs_id]
+        if payload.observations[obs_id]
+        else bdd.negate(node_map[obs_id])
+        for obs_id in obs_ids
+    ]
+
+    prob_list = [probs[eid] for eid in sorted_events]
+    groups = minimal_zero_probability_groups(bdd, literals, prob_list)
+    conflicts = [[obs_ids[i] for i in idxs] for idxs in groups]
+    return ObservationConflictsResponse(conflicts=conflicts)
+
+
 def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
     probs, gate_ops, gate_inputs = _validate_payload(payload)
     sorted_events = sorted(probs)
@@ -1169,6 +1231,26 @@ async def diagnose(payload: DiagnoseRequest) -> DiagnoseResponse:
         return _bad_request(str(exc))  # type: ignore[return-value]
     except ValueError as exc:
         # 未知引用、环、非法观测键、观测矛盾或联合概率为 0 等语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post(
+    "/v1/observation-conflicts",
+    response_model=ObservationConflictsResponse,
+)
+async def observation_conflicts(
+    payload: DiagnoseRequest,
+) -> ObservationConflictsResponse:
+    try:
+        return observation_conflicts_logic(payload)
+    except NodeLimitExceeded as exc:
+        # 树构建或合取读数子集约束时累计非终端节点超过限制
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ConflictLimitExceeded as exc:
+        # 最小零概率观测组超过 5000 组
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ValueError as exc:
+        # 未知引用、环、非法观测键等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]
 
 

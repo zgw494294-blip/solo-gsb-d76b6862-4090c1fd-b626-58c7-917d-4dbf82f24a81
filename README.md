@@ -10,6 +10,9 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 以及联合观测诊断接口 `POST /v1/diagnose`：给定同一时刻对若干事件或门（1～16 个，`AND`/`OR`/`NOT`
 均可）的布尔读数，返回全部读数同时成立的证据概率 `P(E)` 与各事件在该证据下的后验概率
 `P(事件=1 | E) = P(事件=1 且 E)/P(E)`。
+还提供观测冲突枚举接口 `POST /v1/observation-conflicts`：给定 1～16 个对已声明事件或门的
+布尔读数，返回全部**最小零概率观测组**——组内读数同时成立的先验概率为 `0`，删去组内任一项后
+概率严格大于 `0`；全部读数可同时成立时返回空组列。
 还提供下一步观测推荐接口 `POST /v1/inspect-next`：在已有读数 `E`（0～16 个，可为空）下，
 对 1～16 个互异、已声明且未被观测的候选事件/门，分别评估“再观测它一次”对顶事件不确定性的
 期望削减（收益），返回各候选的分支概率、顶事件后验与收益，并给出推荐观测对象。
@@ -42,6 +45,7 @@ docker compose up --build
 - 割集接口：`http://localhost:8000/v1/cut-sets`
 - 修复方案接口：`http://localhost:8000/v1/repair-plan`
 - 联合观测诊断接口：`http://localhost:8000/v1/diagnose`
+- 观测冲突枚举接口：`http://localhost:8000/v1/observation-conflicts`
 - 下一步观测推荐接口：`http://localhost:8000/v1/inspect-next`
 - 最可能成因接口：`http://localhost:8000/v1/likely-cause`
 - 改版对比接口：`http://localhost:8000/v1/compare-trees`
@@ -277,6 +281,75 @@ curl -X POST http://localhost:8000/v1/diagnose \
 ```json
 { "detail": "观测相互矛盾：给定的事件/门读数不可能在同一时刻同时成立（结构约束的合取恒为假），evidence_probability=0" }
 ```
+
+## 观测冲突枚举示例（POST /v1/observation-conflicts）
+
+请求体在 `events` / `gates` / `top` 之外另收 `observations`：**1～16** 个**已声明事件或门 id**
+到**严格布尔值**的映射，格式与校验同 `/v1/diagnose`（门读数 `AND`/`OR`/`NOT` 均可，按共享事件
+状态求值，门与其输入可以同时被观测）。响应只有一个字段：
+
+- `conflicts`：全部**最小零概率观测组**。每组是一组观测 id，使得
+  - 组内读数**同时成立**的先验概率（各事件按独立先验的联合概率）为 `0`；
+  - **删去组内任一项**后，其余读数同时成立的概率严格大于 `0`。
+
+  即按集合包含关系极小的零概率读数子集。全部读数可同时成立时返回空列表 `[]`。
+
+以一个简单电路为例：`a`、`b` 为两个独立事件，门 `g = a AND b`，另有 `ng = NOT g`。
+同时给出“`g` 为真”“`ng` 为真”两条门读数（结构矛盾），并附带一条无关读数 `c=true`：
+
+```bash
+curl -X POST http://localhost:8000/v1/observation-conflicts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "a", "p": "1/2"},
+      {"id": "b", "p": "1/3"},
+      {"id": "c", "p": "1/5"}
+    ],
+    "gates": [
+      {"id": "g",  "op": "AND", "inputs": ["a", "b"]},
+      {"id": "ng", "op": "NOT", "inputs": ["g"]}
+    ],
+    "top": "ng",
+    "observations": {
+      "g": true,
+      "ng": true,
+      "c": true
+    }
+  }'
+```
+
+响应（`g=true` 与 `ng=true` 互斥；无关读数 `c` 不进入冲突组）：
+
+```json
+{
+  "conflicts": [
+    ["g", "ng"]
+  ]
+}
+```
+
+- 门读数不是相互独立的事件：`g` 与 `ng` 是同一组事件状态上的两个布尔结构约束，
+  由 ROBDD 合取后精确判定，`NOT` 门照常生效。
+- 零概率有两类来源，本接口都须识别：
+  - **结构矛盾**：如同时观测 `a=true` 与 `NOT a=true`，约束合取在决策图上恒为假；
+  - **先验零概率**：事件概率为 `0/1` 却读成 `true`、或为 `1/1` 却读成 `false`
+    （结构上可满足，但没有任何正概率的事件状态支持）。
+  例如观测 `{"a": true}` 且事件 `a` 的 `p=0/1` 时，返回 `{"conflicts": [["a"]]}`。
+- 多条冲突会被全部列出。例如下例 `g = a XOR b`（异或），三条读数 `g=true、a=true、b=true`
+  两两都可能同时成立，但三者合取为假，故唯一的冲突组为三项：
+
+  ```json
+  { "conflicts": [["a", "b", "g"]] }
+  ```
+
+- 排序：每组内部的观测 id 按**字典序**排列；组间先按**组长度**、再按组内 id 序列的字典序。
+- 计算在同一 ROBDD 上以经典 MARCO 式极小不可满足子集枚举（seed 的扩张/收缩）精确完成：
+  合取是否零概率完全由决策图加权概率判定，**不枚举事件赋值**；合取节点按读数子集记忆化。
+- **结果超过 5000 组**，或树构建与读数合取过程中**累计 ROBDD 非终端节点超过 50000** 时，
+  返回 422 并在 `detail` 中说明原因。
+- 观测键不是已声明的事件或门 id、值不是严格布尔值、观测为空或超过 16 个，
+  以及 `events`/`gates`/`top` 的各类非法输入，同样返回 422（校验规则与 `/v1/diagnose` 一致）。
 
 ## 下一步观测推荐示例（POST /v1/inspect-next）
 
@@ -666,6 +739,7 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
 | `states`（仅 `/v1/repair-plan`） | 必填，键必须恰好覆盖全部事件 id，值为布尔值；`true` 事件可修复为 `false`，`false` 事件不可改动 |
 | `repair_costs`（仅 `/v1/repair-plan`） | 必填，键必须恰好覆盖全部事件 id，值为 `1`～`10^6` 的整数修复费用 |
 | `observations`（仅 `/v1/diagnose`） | 必填，**1～16** 个键值对；键必须是已声明的事件或门 id，值为严格布尔值；表示同一时刻的读数 |
+| `observations`（仅 `/v1/observation-conflicts`） | 必填，**1～16** 个键值对，格式同 `/v1/diagnose`；求全部最小零概率观测组（组内合取概率为 0、删任一项概率为正） |
 | `observations`（仅 `/v1/inspect-next`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；表示已有读数 |
 | `candidates`（仅 `/v1/inspect-next`） | 必填，**1～16** 个互异、已声明且未被观测的事件或门 id |
 | `observations`（仅 `/v1/likely-cause`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；与顶事件发生一起构成条件 `C` |
@@ -679,6 +753,11 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
 `/v1/diagnose` 则在各观测约束合取得到的 ROBDD 根上做两遍加权传播，同时求 `P(E)` 与每个事件的
 `P(事件=1 且 E)`（ROBDD 路径跳过的变量按自由变量补计其先验），两者相除即得后验。
+`/v1/observation-conflicts` 把每条读数映射为同一 ROBDD 上的字面量（读 `false` 取其 BDD 取反），
+一组读数的合取概率即对应 BDD 节点的加权概率；用 MARCO 式枚举（未标记 seed 合取为零就贪心收缩成
+极小零组并标记其全部超集、为正就贪心扩张成极大正概率子集并标记其全部子集），合取节点按读数子集
+记忆化、概率表增量补算，零概率既包括合取恒为终端 `0` 的结构矛盾，也包括 `p=0/1`、`p=1/1` 先验下
+节点加权概率为 `0` 的情形，全程不枚举事件状态。
 `/v1/inspect-next` 先合取观测约束得到 `E`，再对每个候选 `X` 构建 `E∧X`、`E∧X∧top` 的合取，
 对唯一表做一次自底向上加权即可同时读出全部根的概率；假分支概率由
 `P(E∧¬X) = P(E) − P(E∧X)` 等减法精确得到，无需构建取反合取。
@@ -718,6 +797,10 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
   值不是严格布尔值（`1`、`0`、字符串等同样拒绝）；
 - `/v1/diagnose` 的 `evidence_probability = P(E) = 0`：观测结构矛盾（合取恒假），
   或结构可满足但先验下无正概率支持（如读 `p=0` 的事件为 `true`），响应说明具体原因；
+- `/v1/observation-conflicts` 的 `observations` 为空或超过 **16** 个、键不是已声明的事件或门
+  id、值不是严格布尔值（同 `/v1/diagnose`）；
+- `/v1/observation-conflicts` 返回的最小零概率观测组超过 **5000** 组，响应说明原因
+  （`P(E)=0` 在本接口不报 422，而是作为冲突组正常返回）；
 - `/v1/inspect-next` 的 `observations` 超过 **16** 个或键/值非法、`candidates` 为空、
   超过 **16** 个、存在重复、引用未声明 id 或候选已被观测（多项问题一并说明）；
 - `/v1/inspect-next` 的 `P(E) = 0`（同 `/v1/diagnose` 的两种情形）；
@@ -733,9 +816,11 @@ curl -X POST http://localhost:8000/v1/first-failure-time \
   浮点同样拒绝）、`transitions` 缺少事件对应项或出现未知事件键（多项一并说明）、
   某项的 `fail` / `recover` 不是合法 `n/d` 概率（规则同事件 `p`），或事件数超出 **8** 个；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
-  （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`、
+  （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/observation-conflicts`、
+  `/v1/inspect-next`、
   `/v1/likely-cause`、`/v1/failure-count` 与 `/v1/first-failure-time`；其中
-  `/v1/diagnose`、`/v1/inspect-next`、`/v1/likely-cause` 还含合取观测约束与候选分支
+  `/v1/diagnose`、`/v1/observation-conflicts`、`/v1/inspect-next`、`/v1/likely-cause`
+  还含合取观测约束与候选分支
   新增的节点，`/v1/failure-count` 的计数动态规划与 `/v1/first-failure-time` 的状态空间
   动态规划均不新增 BDD 节点，限额仅针对故障树建图；
   `/v1/compare-trees` 为两版建图及差异运算的累计）。
@@ -767,6 +852,7 @@ app/
   __init__.py
   bdd.py       # ROBDD：唯一表、ITE 算子、精确概率/重要度、联合证据加权与失效数计数分布
   cutsets.py   # 最小割集：位掩码割集族、去重吸收、5000 组上限
+  conflicts.py # 最小零概率观测组：ROBDD 合取概率上的 MARCO 式极小不可满足子集枚举、5000 组上限
   repair.py    # 修复方案：ROBDD 上的受限赋值动态规划（成本/修复数/字典序）
   likely.py    # 最可能成因：ROBDD 上的最大先验乘积赋值动态规划（false 优先）
   first_hit.py # 首次故障时间：未触发状态上的整数公分母马尔可夫动态规划
@@ -778,6 +864,7 @@ tests/test_api.py
 tests/test_cutsets.py
 tests/test_repair.py
 tests/test_diagnose.py
+tests/test_observation_conflicts.py
 tests/test_inspect_next.py
 tests/test_likely_cause.py
 tests/test_compare_trees.py
